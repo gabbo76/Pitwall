@@ -67,6 +67,7 @@ class AppSettings:
     refresh_hz: int = 20
     always_on_top: bool = False
     geometry: str = ""                 # base64 di saveGeometry()
+    settings_version: int = 2          # per migrare i file salvati da versioni precedenti
 
     # volante: unita' del campo steerAngle del server (da verificare con la diagnostica)
     steer_unit: str = "norm"           # "norm" (-1..+1) | "deg" | "rad"
@@ -75,6 +76,11 @@ class AppSettings:
 
     # grafici
     graph_seconds: int = 20            # ampiezza della finestra scorrevole
+
+    # sospensioni: unita' del campo suspensionTravel (da verificare con la diagnostica)
+    susp_unit: str = "auto"            # "auto" | "m" | "cm" | "mm"
+    susp_range_mm: float = 0.0         # corsa totale: 0 = automatica (min/max osservati)
+    susp_invert: bool = False          # se nel sim il valore cresce quando la sospensione si estende
 
     # finestre ottimali (da tarare sulla vostra auto/mescola)
     p_lo: float = 26.8                 # pressione gomme PSI
@@ -106,6 +112,9 @@ class AppSettings:
             self.steer_unit = "norm"
         self.steer_max_deg = min(max(float(self.steer_max_deg), 30.0), 1080.0)
         self.graph_seconds = min(max(int(self.graph_seconds), 5), 120)
+        if self.susp_unit not in ("auto", "m", "cm", "mm"):
+            self.susp_unit = "auto"
+        self.susp_range_mm = min(max(float(self.susp_range_mm), 0.0), 500.0)
         return self
 
 
@@ -140,6 +149,13 @@ def load_settings(path: str | Path | None = None) -> AppSettings:
             setattr(cfg, f.name, v)
         except (TypeError, ValueError):
             pass                       # valore corrotto: resta il default
+    try:
+        file_version = int(raw.get("settings_version", 1))
+    except (TypeError, ValueError):
+        file_version = 1
+    if file_version < 2:                   # prima l'unita' delle sospensioni non era mai stata scelta
+        cfg.susp_unit = "auto"
+    cfg.settings_version = 2
     return cfg.sanitize()
 
 
@@ -261,6 +277,59 @@ def thin_samples(samples: list, max_points: int) -> list:
                 or f != samples[i - 1][2] or (i + 1 < n and f != samples[i + 1][2])):
             out.append(smp)
     return out
+
+
+def travel_to_mm(value: float, unit: str) -> float:
+    return value * {"m": 1000.0, "cm": 10.0, "mm": 1.0}.get(unit, 1000.0)
+
+
+def resolve_susp_unit(unit: str, raw: list, seen_big: bool) -> tuple:
+    """
+    'auto': se qualche valore grezzo e' >= 1 non possono essere metri (una sospensione non
+    ha 1 m di corsa), quindi sono millimetri; altrimenti si assumono metri (valori ~0.05).
+    Una volta visto un valore grande si resta su millimetri.
+    """
+    if unit != "auto":
+        return unit, seen_big
+    if not seen_big and any(abs(v) >= 1.0 for v in raw):
+        seen_big = True
+    return ("mm" if seen_big else "m"), seen_big
+
+
+class TravelTracker:
+    """
+    Posizione normalizzata delle 4 sospensioni: 0 = estesa, 1 = compressa a fondo corsa.
+    Con corsa totale nota (fixed_range_mm > 0) si usa quella; altrimenti il minimo e il
+    massimo osservati dal momento dell'azzeramento (la scala si adatta guidando).
+    """
+    MIN_SPAN_MM = 5.0
+
+    def __init__(self, n: int = 4):
+        self.n = n
+        self.reset()
+
+    def reset(self) -> None:
+        self.lo: list = [None] * self.n
+        self.hi: list = [None] * self.n
+
+    def update(self, mm: list) -> None:
+        for i, v in enumerate(mm):
+            if self.lo[i] is None:
+                self.lo[i] = self.hi[i] = v
+            else:
+                self.lo[i] = min(self.lo[i], v)
+                self.hi[i] = max(self.hi[i], v)
+
+    def norm(self, i: int, mm: float, fixed_range_mm: float = 0.0, invert: bool = False) -> float:
+        if fixed_range_mm > 0:
+            c = mm / fixed_range_mm
+        else:
+            lo, hi = self.lo[i], self.hi[i]
+            if lo is None or hi - lo < 0.5:        # ancora nessuna escursione: posizione centrale
+                return 0.5
+            c = (mm - lo) / max(hi - lo, self.MIN_SPAN_MM)
+        c = min(max(c, 0.0), 1.0)
+        return 1.0 - c if invert else c
 
 
 def gear_name(gear: int) -> str:
