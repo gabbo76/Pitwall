@@ -3,3 +3,6 @@ __pycache__/
 
 # Example server
 Data from file/
+
+# Test tyres
+check_tyre_temps.py

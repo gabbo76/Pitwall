@@ -21,7 +21,7 @@ import socket
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # --------------------------------------------------------------------------
 # 1. Layout binario del pacchetto
@@ -285,6 +285,17 @@ class TelemetryModel:
         with self._lock:
             for item in reversed(self._hist):
                 if item[0] < t0:
+                    break
+                out.append(item)
+        out.reverse()
+        return out
+
+    def history_since(self, t: float) -> list:
+        """Solo i campioni arrivati DOPO l'istante t (time.monotonic), dal piu' vecchio al piu' recente."""
+        out = []
+        with self._lock:
+            for item in reversed(self._hist):
+                if item[0] <= t:
                     break
                 out.append(item)
         out.reverse()

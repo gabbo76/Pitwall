@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from bisect import bisect_right
 from collections import deque
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -111,7 +112,7 @@ class AppSettings:
         if self.steer_unit not in ("norm", "deg", "rad"):
             self.steer_unit = "norm"
         self.steer_max_deg = min(max(float(self.steer_max_deg), 30.0), 1080.0)
-        self.graph_seconds = min(max(int(self.graph_seconds), 5), 120)
+        self.graph_seconds = min(max(int(self.graph_seconds), 2), 120)
         if self.susp_unit not in ("auto", "m", "cm", "mm"):
             self.susp_unit = "auto"
         self.susp_range_mm = min(max(float(self.susp_range_mm), 0.0), 500.0)
@@ -260,25 +261,6 @@ def steer_out_of_range(value: float, unit: str) -> bool:
     return unit == "norm" and abs(value) > 1.05
 
 
-def thin_samples(samples: list, max_points: int) -> list:
-    """
-    Riduce i campioni (t, valore, flag) a circa max_points senza perdere gli eventi:
-    i campioni con flag attivo e quelli ai bordi di un cambio di flag restano tutti,
-    cosi' un intervento breve di TC/ABS non sparisce dal grafico.
-    """
-    n = len(samples)
-    if max_points <= 0 or n <= max_points:
-        return samples
-    step = -(-n // max_points)                     # divisione per eccesso
-    out = []
-    for i, smp in enumerate(samples):
-        f = smp[2]
-        if (i % step == 0 or i == n - 1 or f
-                or f != samples[i - 1][2] or (i + 1 < n and f != samples[i + 1][2])):
-            out.append(smp)
-    return out
-
-
 def travel_to_mm(value: float, unit: str) -> float:
     return value * {"m": 1000.0, "cm": 10.0, "mm": 1.0}.get(unit, 1000.0)
 
@@ -332,29 +314,118 @@ class TravelTracker:
         return 1.0 - c if invert else c
 
 
+class Chunk:
+    """Blocco di punti consecutivi con lo stesso flag. 'path' e 'fill' li riempie la grafica."""
+    __slots__ = ("flag", "pts", "t1", "path", "fill", "dirty")
+
+    def __init__(self, flag: int):
+        self.flag = flag
+        self.pts: list = []
+        self.t1 = 0.0
+        self.path = None
+        self.fill = None
+        self.dirty = True
+
+
+class ChunkedSeries:
+    """
+    Serie temporale per i grafici scorrevoli, a blocchi di ~1 s.
+
+    Perche': ridisegnare un grafico ricostruendo tutti i punti a ogni scatto costa molto.
+    Qui si aggiungono solo i campioni nuovi; i blocchi gia' chiusi non cambiano piu' e la
+    grafica li conserva (path gia' pronto), si ricostruisce solo il blocco in corso.
+    Un blocco ha un solo 'flag' (es. TC attivo): cambiando flag ne parte uno nuovo, che
+    inizia dall'ultimo punto del precedente cosi' la linea non ha buchi.
+    I tratti piatti (valore invariato) vengono compressi: si allunga l'ultimo punto.
+    """
+
+    def __init__(self, chunk_s: float = 1.0, keep_s: float = 65.0):
+        self.chunk_s = chunk_s
+        self.keep_s = keep_s
+        self.chunks: deque = deque()
+        self.t0: float | None = None           # origine dei tempi: tiene piccoli i numeri nei path
+        self.last_t: float | None = None
+
+    def clear(self) -> None:
+        self.chunks.clear()
+        self.t0 = None
+        self.last_t = None
+
+    def add(self, t: float, v: float, flag: int = 0) -> None:
+        if self.t0 is None:
+            self.t0 = t
+        ch = self.chunks[-1] if self.chunks else None
+        if ch is None or ch.flag != flag or t - ch.pts[0][0] >= self.chunk_s:
+            new = Chunk(flag)
+            if ch is not None:
+                new.pts.append(ch.pts[-1])             # raccordo col blocco precedente
+            self.chunks.append(new)
+            ch = new
+        pts = ch.pts
+        if len(pts) >= 2 and pts[-1][1] == v and pts[-2][1] == v:
+            pts[-1] = (t, v)                           # tratto piatto: allungo l'ultimo punto
+        else:
+            pts.append((t, v))
+        ch.t1 = t
+        ch.dirty = True
+        self.last_t = t
+        t_min = t - self.keep_s
+        while len(self.chunks) > 1 and self.chunks[0].t1 < t_min:
+            self.chunks.popleft()
+
+    def visible(self, t_min: float) -> list:
+        return [c for c in self.chunks if c.t1 >= t_min]
+
+    def value_at(self, t: float, hold: bool = False) -> float | None:
+        """Valore all'istante t (interpolato, oppure l'ultimo noto se hold=True: per le marce)."""
+        if self.last_t is None or t > self.last_t + 0.25:
+            return None
+        for ch in reversed(self.chunks):
+            pts = ch.pts
+            if pts[0][0] <= t:
+                i = bisect_right([p[0] for p in pts], t) - 1
+                if i < 0:
+                    continue
+                if hold or i == len(pts) - 1:
+                    return pts[i][1]
+                (ta, va), (tb, vb) = pts[i], pts[i + 1]
+                return vb if tb == ta else va + (vb - va) * (t - ta) / (tb - ta)
+        return None
+
+
+class BrakeTracker:
+    """Usura di pastiglie e dischi dall'inizio della sessione + scala per la pressione freno."""
+
+    def __init__(self, n: int = 4):
+        self.n = n
+        self.reset()
+
+    def reset(self) -> None:
+        self.pad0: list = [None] * self.n          # spessore al primo campione valido
+        self.disc0: list = [None] * self.n
+        self.press_max = 0.0
+
+    def update(self, pads: list, discs: list, press: list) -> None:
+        for i in range(self.n):
+            if self.pad0[i] is None and pads[i] > 0:
+                self.pad0[i] = pads[i]
+            if self.disc0[i] is None and discs[i] > 0:
+                self.disc0[i] = discs[i]
+        self.press_max = max(self.press_max, max(press))
+
+    def pad_used(self, i: int, now: float) -> float | None:
+        return None if self.pad0[i] is None else max(0.0, self.pad0[i] - now)
+
+    def disc_used(self, i: int, now: float) -> float | None:
+        return None if self.disc0[i] is None else max(0.0, self.disc0[i] - now)
+
+    def press_norm(self, v: float) -> float:
+        return min(max(v / self.press_max, 0.0), 1.0) if self.press_max > 0 else 0.0
+
+
 def gear_name(gear: int) -> str:
     """Convenzione del server: -1 = R, 0 = N, 1.. = marce."""
     return "R" if gear < 0 else "N" if gear == 0 else str(gear)
-
-
-def gear_steps(samples: list) -> list:
-    """
-    Da [(t, marcia), ...] a punti (t, marcia, 0) per un grafico A GRADINI: a ogni cambio
-    si inserisce prima il punto con la marcia vecchia e poi quello con la nuova allo
-    stesso istante, cosi' il passaggio e' verticale. Tiene solo i cambi (pochi punti).
-    """
-    out: list = []
-    last = None
-    for t, g in samples:
-        if last is None:
-            out.append((t, g, 0))
-        elif g != last:
-            out.append((t, last, 0))
-            out.append((t, g, 0))
-        last = g
-    if samples and out[-1][0] != samples[-1][0]:
-        out.append((samples[-1][0], last, 0))          # prolunga fino all'ultimo campione
-    return out
 
 
 def fmt_ms(ms: int) -> str:
