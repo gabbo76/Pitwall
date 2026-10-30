@@ -27,6 +27,8 @@ QFrame#sep { background: #2c333d; border: none; }
 QLabel#caption { color: #8b95a3; font-size: 10px; font-weight: 600; }
 QLabel#value { font-size: 19px; font-weight: 600; }
 QLabel#valueBig { font-size: 32px; font-weight: 700; }
+QLabel#valueMono { font-family: "Cascadia Mono", "Consolas", "Courier New", monospace;
+    font-size: 18px; font-weight: 700; }
 QLabel#title { color: #aab4c2; font-size: 12px; font-weight: 700; }
 QLabel#gear { font-size: 104px; font-weight: 800; }
 QLabel#flag { font-size: 14px; font-weight: 700; padding: 4px 10px; border-radius: 4px; }
@@ -55,17 +57,25 @@ QProgressBar#brk::chunk { background: #e74c3c; }
 
 
 class Metric(QWidget):
-    """Didascalia piccola + valore colorato per livello. Ridisegna solo se cambia."""
+    """
+    Didascalia piccola + valore colorato per livello. Ridisegna solo se cambia.
 
-    def __init__(self, caption: str, big: bool = False):
+    Per le voci in una riga orizzontale (intestazione) la larghezza non deve dipendere dal
+    testo corrente, altrimenti ogni cambio di cifre sposta le voci a destra:
+      - sample: il testo piu' largo previsto; la voce riserva sempre almeno quella larghezza;
+      - mono: usa un font a larghezza fissa, cosi' tutte le cifre occupano lo stesso spazio.
+    """
+
+    def __init__(self, caption: str, big: bool = False, sample: str = "", mono: bool = False):
         super().__init__()
+        self._sample = sample
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         self.cap = QLabel(caption)
         self.cap.setObjectName("caption")
         self.val = QLabel("--")
-        self.val.setObjectName("valueBig" if big else "value")
+        self.val.setObjectName("valueBig" if big else "valueMono" if mono else "value")
         lay.addWidget(self.cap)
         lay.addWidget(self.val)
         self._last: tuple | None = None
@@ -81,13 +91,24 @@ class Metric(QWidget):
     def set_caption(self, text: str) -> None:
         self.cap.setText(text)
 
+    def sizeHint(self):
+        """Larghezza = max(testo attuale, testo piu' largo previsto): non cambia al cambiare delle cifre."""
+        hint = super().sizeHint()
+        if self._sample:
+            self.val.ensurePolished()               # serve per avere il font dello stile applicato
+            self.cap.ensurePolished()
+            wanted = max(self.val.fontMetrics().horizontalAdvance(self._sample),
+                         self.cap.fontMetrics().horizontalAdvance(self.cap.text()))
+            hint.setWidth(max(hint.width(), wanted))
+        return hint
+
 
 class FlagLabel(QLabel):
     def __init__(self):
         super().__init__("")
         self.setObjectName("flag")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumWidth(90)
+        self.setMinimumWidth(120)               # abbastanza per 'PENALITA'' senza allargarsi
         self._last: tuple | None = None
 
     def set_flag(self, text: str, bg: str | None, fg: str | None) -> None:
